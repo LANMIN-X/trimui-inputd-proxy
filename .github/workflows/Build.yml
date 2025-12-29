@@ -1,0 +1,68 @@
+name: trimui_inputd_proxy Build
+
+on:
+  workflow_dispatch: # 手动触发
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Enable QEMU for ARM64
+        uses: docker/setup-qemu-action@v3
+
+      - name: Build in Ubuntu 20.04 (ARM64)
+        run: |
+          mkdir -p build_aarch64
+          docker run --rm --platform=linux/arm64 \
+            -v $PWD:/workspace \
+            -w /workspace \
+            arm64v8/ubuntu:20.04 bash -e -c "
+              apt-get update
+              apt-get install -y build-essential
+              
+              gcc \
+                -O2 \
+                -static-libgcc \
+                -o build_aarch64/trimui_inputd_proxy \
+                trimui_inputd_proxy.c \
+                -lm -pthread
+
+              echo 'Build complete.'
+              echo 'GLIBC symbols used:'
+              strings build_aarch64/trimui_inputd_proxy | grep GLIBC_ || true
+            "
+
+      - name: Validate GLIBC version
+        run: |
+          if strings build_aarch64/trimui_inputd_proxy | grep -q 'GLIBC_2\.34'; then
+            echo "Error: Binary requires GLIBC_2.34 or newer, which is too new for target system"
+            exit 1
+          fi
+          echo "GLIBC version check passed"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: trimui_inputd_proxy-aarch64
+          path: build_aarch64/trimui_inputd_proxy
+
+      - name: Generate release tag
+        id: tagger
+        run: |
+          echo "tag=aarch64-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tagger.outputs.tag }}
+          name: trimui_inputd_proxy ${{ steps.tagger.outputs.tag }}
+          文件: build_aarch64/trimui_inputd_proxy
+          draft: false
+          prerelease: false
+          generate_release_notes: true
