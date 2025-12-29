@@ -9,7 +9,7 @@
  * - 通用 VID/PID，避免 SDL2 自动反转 D-Pad
  *
  * 编译：
- * gcc -O2 -o trimui_input_proxy trimui_input_proxy.c -lm
+ * gcc -O2 -o trimui_inputd_proxy trimui_inputd_proxy.c -lm
  */
 
 #include <linux/uinput.h>
