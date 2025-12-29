@@ -62,7 +62,7 @@ jobs:
         with:
           tag_name: ${{ steps.tagger.outputs.tag }}
           name: trimui_inputd_proxy ${{ steps.tagger.outputs.tag }}
-          文件: build_aarch64/trimui_inputd_proxy
+          files: build_aarch64/trimui_inputd_proxy
           draft: false
           prerelease: false
           generate_release_notes: true
