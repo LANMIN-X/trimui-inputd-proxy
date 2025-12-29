@@ -4,9 +4,6 @@
  * 功能：
  * - uinput 虚拟手柄
  * - GPIO 真实震动（Force Feedback Rumble）
- * - 非阻塞 IO，防死锁
- * - 防止游戏震动洪泛
- * - 通用 VID/PID，避免 SDL2 自动反转 D-Pad
  *
  * 编译：
  * gcc -O2 -o trimui_inputd_proxy trimui_inputd_proxy.c -lm
@@ -36,7 +33,7 @@
 static volatile sig_atomic_t keep_running = 1;
 
 /* ============================================================
- * GPIO 震动控制（防抖 + 非阻塞）
+ * GPIO 震动控制
  * ============================================================ */
 #define RUMBLE_SYSFS_PATH "/sys/class/gpio/gpio227/value"
 
@@ -57,7 +54,7 @@ static void gpio_set_rumble(bool active) {
 
     if (g_gpio_fd >= 0) {
         char v = active ? '1' : '0';
-        write(g_gpio_fd, &v, 1); /* 忽略错误，绝不阻塞 */
+        write(g_gpio_fd, &v, 1); 
     }
 
     g_gpio_last_state = new_state;
@@ -242,7 +239,7 @@ static int create_virtual_pad(void) {
     struct uinput_setup setup = {0};
     strncpy(setup.name, DEVICE_NAME, sizeof(setup.name) - 1);
 
-    /* 通用 VID/PID，避免 SDL2 误识别 */
+    /* 通用 VID/PID */
     setup.id.bustype = BUS_USB;
     setup.id.vendor  = 0x0000;
     setup.id.product = 0x0000;
