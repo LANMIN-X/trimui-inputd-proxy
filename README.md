@@ -41,5 +41,5 @@
 - Trimui_Smart_Pro_Inputd  
   https://github.com/Jpe230/Trimui_Smart_Pro_Inputd
 
-也可以直接用他的，不过他的这个按键无法全部正确隐射，需要获取硬件的按键码才能正确全部被是识别。 
+也可以直接用他的，不过他的这个按键无法全部正确隐射，需要获取硬件的按键码才能正确全部被是识别。  
 我这个是代理inputd，他这个是一个完整的inputd
