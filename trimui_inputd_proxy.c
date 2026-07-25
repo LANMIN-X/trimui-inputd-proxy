@@ -7,7 +7,7 @@
  * - 软件 PWM 算法，提供细腻震动反馈
  *
  * 编译：
- * gcc -O2 -o trimui_inputd_proxy proxy.c -lm
+ * gcc -O2 -Wall -Wextra -std=gnu11 -o trimui_inputd_proxy trimui_inputd_proxy.c
  */
 
 #include <linux/uinput.h>
@@ -40,8 +40,9 @@
 
 // PWM 震动参数 (调节手感)
 #define RUMBLE_DEADZONE   2000   // 忽略极微小的噪音信号
-#define PWM_THRESHOLD     40000  // 超过此强度全速震动，低于此强度脉冲震动
 #define SAFETY_TIMEOUT_MS 3000   // 最长震动时间，防止卡死
+#define PWM_PERIOD_NS     20000000L
+#define RUMBLE_MAX_MAGNITUDE (UINT16_MAX * 2U)
 
 static volatile sig_atomic_t keep_running = 1;
 
@@ -51,17 +52,19 @@ static volatile sig_atomic_t keep_running = 1;
 static int g_gpio_fd = -1;
 static int g_gpio_last_state = -1;
 
-static void gpio_init(void) {
+static int gpio_init(void) {
     g_gpio_fd = open(RUMBLE_GPIO_PATH, O_WRONLY | O_NONBLOCK);
+    return g_gpio_fd < 0 ? -1 : 0;
 }
 
-static void gpio_set(int state) {
-    if (state == g_gpio_last_state) return;
+static int gpio_set(int state) {
+    if (state == g_gpio_last_state) return 0;
     if (g_gpio_fd >= 0) {
         char v = state ? '1' : '0';
-        write(g_gpio_fd, &v, 1);
+        if (write(g_gpio_fd, &v, 1) != 1) return -1;
     }
     g_gpio_last_state = state;
+    return 0;
 }
 
 /* ============================================================
@@ -77,11 +80,11 @@ typedef struct {
 typedef struct {
     rumble_slot_t slots[RUMBLE_MAX_EFFECTS];
     
-    bool active;           // 是否处于震动状态
-    uint32_t magnitude;    // 当前震动总强度
-    struct timespec stop_time; // 预计停止时间
-    
-    uint32_t pwm_counter;  // PWM 计数器
+    bool active;
+    int active_id;
+    uint32_t magnitude;
+    struct timespec start_time;
+    struct timespec stop_time;
 } rumble_ctx_t;
 
 static void timespec_now(struct timespec *ts) {
@@ -105,8 +108,12 @@ static bool timespec_passed(const struct timespec *stop_at) {
     return now.tv_nsec >= stop_at->tv_nsec;
 }
 
+static long timespec_diff_ns(const struct timespec *a, const struct timespec *b) {
+    return (a->tv_sec - b->tv_sec) * 1000000000L + a->tv_nsec - b->tv_nsec;
+}
+
 static int rumble_upload(rumble_ctx_t *ctx, struct ff_effect *eff) {
-    if (eff->type != FF_RUMBLE) return 0;
+    if (eff->type != FF_RUMBLE) return -EINVAL;
     int id = eff->id;
     if (id < 0) {
         for (int i = 0; i < RUMBLE_MAX_EFFECTS; i++) {
@@ -123,104 +130,105 @@ static int rumble_upload(rumble_ctx_t *ctx, struct ff_effect *eff) {
 }
 
 static int rumble_erase(rumble_ctx_t *ctx, int id) {
-    if (id >= 0 && id < RUMBLE_MAX_EFFECTS) {
-        ctx->slots[id].in_use = false;
+    if (id < 0 || id >= RUMBLE_MAX_EFFECTS || !ctx->slots[id].in_use)
+        return -EINVAL;
+
+    ctx->slots[id].in_use = false;
+    if (ctx->active && ctx->active_id == id) {
         ctx->active = false;
-        gpio_set(0);
+        return gpio_set(0);
     }
     return 0;
 }
 
-static void rumble_play(rumble_ctx_t *ctx, int id, int val) {
+static int rumble_play(rumble_ctx_t *ctx, int id, int val) {
     if (val == 0) {
-        ctx->active = false;
-        gpio_set(0);
-        return;
+        if (ctx->active && ctx->active_id == id) {
+            ctx->active = false;
+            return gpio_set(0);
+        }
+        return 0;
     }
-    if (id < 0 || id >= RUMBLE_MAX_EFFECTS || !ctx->slots[id].in_use) return;
+    if (id < 0 || id >= RUMBLE_MAX_EFFECTS || !ctx->slots[id].in_use) return -EINVAL;
 
     struct ff_effect *e = &ctx->slots[id].effect;
     
     uint32_t mag = e->u.rumble.strong_magnitude + e->u.rumble.weak_magnitude;
     if (mag < RUMBLE_DEADZONE) {
         ctx->active = false;
-        gpio_set(0);
-        return;
+        return gpio_set(0);
     }
 
-    ctx->magnitude = mag;
+    ctx->magnitude = mag > RUMBLE_MAX_MAGNITUDE ? RUMBLE_MAX_MAGNITUDE : mag;
     unsigned int dur = e->replay.length;
     if (dur == 0 || dur > SAFETY_TIMEOUT_MS) dur = SAFETY_TIMEOUT_MS;
 
-    timespec_now(&ctx->stop_time);
+    timespec_now(&ctx->start_time);
+    timespec_add_ms(&ctx->start_time, e->replay.delay);
+    ctx->stop_time = ctx->start_time;
     timespec_add_ms(&ctx->stop_time, dur);
-    
+    ctx->active_id = id;
     ctx->active = true;
+    return 0;
 }
 
-// 模拟 PWM 的心跳函数
-static void rumble_tick(rumble_ctx_t *ctx) {
+static int rumble_tick(rumble_ctx_t *ctx) {
     if (!ctx->active) {
-        gpio_set(0);
-        return;
+        return gpio_set(0);
     }
 
     if (timespec_passed(&ctx->stop_time)) {
         ctx->active = false;
-        gpio_set(0);
-        return;
+        return gpio_set(0);
     }
 
-    // PWM 逻辑
-    if (ctx->magnitude >= PWM_THRESHOLD) {
-        // 强震：全速
-        gpio_set(1);
-    } else {
-        // 弱震：脉冲 (50% 占空比, 25Hz)
-        ctx->pwm_counter++;
-        if ((ctx->pwm_counter % 4) < 2) {
-            gpio_set(1);
-        } else {
-            gpio_set(0);
-        }
-    }
+    struct timespec now;
+    timespec_now(&now);
+    if (timespec_diff_ns(&now, &ctx->start_time) < 0) return gpio_set(0);
+
+    long phase = timespec_diff_ns(&now, &ctx->start_time) % PWM_PERIOD_NS;
+    long on_time = (long)((uint64_t)PWM_PERIOD_NS * ctx->magnitude / RUMBLE_MAX_MAGNITUDE);
+    return gpio_set(phase < on_time);
 }
 
 /* ============================================================
  * uinput 虚拟设备
  * ============================================================ */
-static void setup_abs(int fd, int code, int min, int max, int fuzz, int flat) {
+static int setup_abs(int fd, int code, int min, int max, int fuzz, int flat) {
     struct uinput_abs_setup abs = {0};
     abs.code = code;
     abs.absinfo.minimum = min;
     abs.absinfo.maximum = max;
     abs.absinfo.fuzz = fuzz;
     abs.absinfo.flat = flat;
-    ioctl(fd, UI_ABS_SETUP, &abs);
+    return ioctl(fd, UI_ABS_SETUP, &abs);
 }
 
 static int create_virtual_pad(void) {
     int fd = open("/dev/uinput", O_RDWR | O_NONBLOCK);
     if (fd < 0) return -1;
 
-    ioctl(fd, UI_SET_EVBIT, EV_KEY);
-    ioctl(fd, UI_SET_EVBIT, EV_ABS);
-    ioctl(fd, UI_SET_EVBIT, EV_FF);
-    ioctl(fd, UI_SET_EVBIT, EV_SW); // 加上 SW
+#define SET_IOCTL(request, value) do { \
+    if (ioctl(fd, (request), (value)) < 0) { perror(#request); goto fail; } \
+} while (0)
+
+    SET_IOCTL(UI_SET_EVBIT, EV_KEY);
+    SET_IOCTL(UI_SET_EVBIT, EV_ABS);
+    SET_IOCTL(UI_SET_EVBIT, EV_FF);
+    SET_IOCTL(UI_SET_EVBIT, EV_SW);
 
     // 按键定义 (匹配原厂)
     int keys[] = {304,305,307,308, 310,311, 314,315, 316, 317,318};
-    for (int i=0; i < sizeof(keys)/sizeof(int); i++) 
-        ioctl(fd, UI_SET_KEYBIT, keys[i]);
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+        SET_IOCTL(UI_SET_KEYBIT, keys[i]);
 
     // 轴定义
     int axes[] = {ABS_X, ABS_Y, ABS_Z, ABS_RX, ABS_RY, ABS_RZ, ABS_HAT0X, ABS_HAT0Y};
-    for (int i=0; i < sizeof(axes)/sizeof(int); i++) 
-        ioctl(fd, UI_SET_ABSBIT, axes[i]);
+    for (size_t i = 0; i < sizeof(axes) / sizeof(axes[0]); i++)
+        SET_IOCTL(UI_SET_ABSBIT, axes[i]);
 
-    ioctl(fd, UI_SET_FFBIT, FF_RUMBLE);
-    ioctl(fd, UI_SET_FFBIT, FF_GAIN);
-    ioctl(fd, UI_SET_SWBIT, SW_TABLET_MODE);
+    SET_IOCTL(UI_SET_FFBIT, FF_RUMBLE);
+    SET_IOCTL(UI_SET_SWBIT, SW_TABLET_MODE);
 
     struct uinput_setup setup = {0};
     strncpy(setup.name, DEVICE_NAME, sizeof(setup.name) - 1);
@@ -230,23 +238,38 @@ static int create_virtual_pad(void) {
     setup.id.version = DEVICE_VERSION;
     setup.ff_effects_max = RUMBLE_MAX_EFFECTS;
 
-    ioctl(fd, UI_DEV_SETUP, &setup);
+    SET_IOCTL(UI_DEV_SETUP, &setup);
 
     // 轴参数 (精确匹配原厂)
-    setup_abs(fd, ABS_X, -32767, 32767, 0, 0);
-    setup_abs(fd, ABS_Y, -32767, 32767, 0, 0);
-    setup_abs(fd, ABS_RX,-32767, 32767, 0, 0);
-    setup_abs(fd, ABS_RY,-32767, 32767, 0, 0);
-    setup_abs(fd, ABS_Z, 0, 255, 0, 0);
-    setup_abs(fd, ABS_RZ,0, 255, 0, 0);
-    setup_abs(fd, ABS_HAT0X,-1, 1, 0, 0);
-    setup_abs(fd, ABS_HAT0Y,-1, 1, 0, 0);
+    if (setup_abs(fd, ABS_X, -32767, 32767, 0, 0) < 0 ||
+        setup_abs(fd, ABS_Y, -32767, 32767, 0, 0) < 0 ||
+        setup_abs(fd, ABS_RX, -32767, 32767, 0, 0) < 0 ||
+        setup_abs(fd, ABS_RY, -32767, 32767, 0, 0) < 0 ||
+        setup_abs(fd, ABS_Z, 0, 255, 0, 0) < 0 ||
+        setup_abs(fd, ABS_RZ, 0, 255, 0, 0) < 0 ||
+        setup_abs(fd, ABS_HAT0X, -1, 1, 0, 0) < 0 ||
+        setup_abs(fd, ABS_HAT0Y, -1, 1, 0, 0) < 0) {
+        perror("UI_ABS_SETUP");
+        goto fail;
+    }
 
     if (ioctl(fd, UI_DEV_CREATE) < 0) {
-        close(fd);
-        return -1;
+        goto fail;
     }
     return fd;
+
+fail:
+    close(fd);
+    return -1;
+#undef SET_IOCTL
+}
+
+static int forward_event(int fd, const struct input_event *ev) {
+    ssize_t written;
+    do {
+        written = write(fd, ev, sizeof(*ev));
+    } while (written < 0 && errno == EINTR);
+    return written == sizeof(*ev) ? 0 : -1;
 }
 
 static void handle_signal(int sig) {
@@ -258,18 +281,27 @@ int main(void) {
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     
-    gpio_init();
-    rumble_ctx_t rumble = {0};
+    if (gpio_init() < 0) {
+        perror("Cannot open rumble GPIO");
+        return 1;
+    }
+    rumble_ctx_t rumble = { .active_id = -1 };
 
     // 1. 打开被脚本隐藏的真实设备
     int src_fd = open(REAL_DEV_PATH, O_RDONLY | O_NONBLOCK);
     if (src_fd < 0) {
         fprintf(stderr, "FATAL: Cannot open %s. Please run start_proxy.sh first!\n", REAL_DEV_PATH);
+        close(g_gpio_fd);
         return 1;
     }
     
     // 2. 依然执行 Grab，防止意外泄漏
-    ioctl(src_fd, EVIOCGRAB, 1);
+    if (ioctl(src_fd, EVIOCGRAB, 1) < 0) {
+        perror("Cannot grab source device");
+        close(src_fd);
+        close(g_gpio_fd);
+        return 1;
+    }
 
     // 3. 创建虚拟设备
     int virt_fd = create_virtual_pad();
@@ -288,9 +320,15 @@ int main(void) {
     printf("Proxy started. Reading %s, Outputting Virtual Pad with PWM Rumble.\n", REAL_DEV_PATH);
 
     while (keep_running) {
-        // 10ms 轮询周期，配合 PWM 逻辑
         if (poll(fds, 2, 10) < 0) {
             if (errno == EINTR) continue;
+            perror("poll");
+            break;
+        }
+
+        if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL) ||
+            fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "Input device disconnected or failed\n");
             break;
         }
 
@@ -302,19 +340,31 @@ int main(void) {
                     if (ev.code == UI_FF_UPLOAD) {
                         struct uinput_ff_upload up; up.request_id = ev.value;
                         if (ioctl(virt_fd, UI_BEGIN_FF_UPLOAD, &up) >= 0) {
-                            rumble_upload(&rumble, &up.effect);
-                            up.retval = 0;
-                            ioctl(virt_fd, UI_END_FF_UPLOAD, &up);
+                            up.retval = rumble_upload(&rumble, &up.effect);
+                            if (ioctl(virt_fd, UI_END_FF_UPLOAD, &up) < 0) {
+                                perror("UI_END_FF_UPLOAD");
+                                keep_running = 0;
+                            }
+                        } else {
+                            perror("UI_BEGIN_FF_UPLOAD");
+                            keep_running = 0;
                         }
                     } else if (ev.code == UI_FF_ERASE) {
                         struct uinput_ff_erase er; er.request_id = ev.value;
                         if (ioctl(virt_fd, UI_BEGIN_FF_ERASE, &er) >= 0) {
-                            rumble_erase(&rumble, er.effect_id);
-                            ioctl(virt_fd, UI_END_FF_ERASE, &er);
+                            er.retval = rumble_erase(&rumble, er.effect_id);
+                            if (ioctl(virt_fd, UI_END_FF_ERASE, &er) < 0) {
+                                perror("UI_END_FF_ERASE");
+                                keep_running = 0;
+                            }
+                        } else {
+                            perror("UI_BEGIN_FF_ERASE");
+                            keep_running = 0;
                         }
                     }
-                } else if (ev.type == EV_FF && ev.code != FF_GAIN) {
-                    rumble_play(&rumble, ev.code, ev.value);
+                } else if (ev.type == EV_FF) {
+                    if (rumble_play(&rumble, ev.code, ev.value) < 0)
+                        fprintf(stderr, "Invalid rumble effect %u\n", ev.code);
                 }
             }
         }
@@ -323,16 +373,22 @@ int main(void) {
         if (fds[0].revents & POLLIN) {
             struct input_event ev;
             while (read(src_fd, &ev, sizeof(ev)) == sizeof(ev)) {
-                write(virt_fd, &ev, sizeof(ev));
+                if (forward_event(virt_fd, &ev) < 0) {
+                    perror("Forward input event");
+                    keep_running = 0;
+                    break;
+                }
             }
         }
 
-        // 更新 PWM 震动状态
-        rumble_tick(&rumble);
+        if (rumble_tick(&rumble) < 0) {
+            perror("Set rumble GPIO");
+            break;
+        }
     }
 
     // 清理
-    gpio_set(0);
+    (void)gpio_set(0);
     if (g_gpio_fd >= 0) close(g_gpio_fd);
     
     ioctl(virt_fd, UI_DEV_DESTROY);
